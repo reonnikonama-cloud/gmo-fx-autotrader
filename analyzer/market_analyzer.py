@@ -5,7 +5,15 @@ from typing import Dict, Any, Optional
 class MarketAnalyzer:
     def __init__(self, api_key: Optional[str] = None):
         key = api_key or os.getenv("GEMINI_API_KEY")
-        self.client = genai.Client(api_key=key) if key else None
+        # 空文字やNoneの場合は初期化せずスキップ
+        if key and key.strip():
+            try:
+                self.client = genai.Client(api_key=key.strip())
+            except Exception as e:
+                print(f"[MarketAnalyzer] Gemini初期化エラー: {e}")
+                self.client = None
+        else:
+            self.client = None
 
     def generate_daily_ai_report(self, daily_summary: Dict[str, Any], positions: Any = None, rates: Any = None) -> str:
         if not self.client:
