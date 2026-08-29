@@ -21,6 +21,26 @@ class BasicStrategy:
         self.circuit_breaker_triggered = False
         self.last_reset_date = None
 
+    def get_parameters(self) -> dict:
+        """現在の戦略パラメータを取得"""
+        return {
+            "short_window": self.short_window,
+            "long_window": self.long_window,
+            "rsi_window": self.rsi_window,
+            "atr_window": self.atr_window
+        }
+
+    def update_parameters(self, new_params: dict):
+        """自己成長エンジンからのパラメータ動的適用"""
+        old_params = self.get_parameters()
+        self.short_window = new_params.get("short_window", self.short_window)
+        self.long_window = new_params.get("long_window", self.long_window)
+        self.rsi_window = new_params.get("rsi_window", self.rsi_window)
+        self.atr_window = new_params.get("atr_window", self.atr_window)
+        print(f"【戦略自己進化】パラメータ更新完了:")
+        print(f"  Old: {old_params}")
+        print(f"  New: {self.get_parameters()}")
+
     def calculate_atr(self, df: pd.DataFrame) -> float:
         """
         ATR (Average True Range) の計算
