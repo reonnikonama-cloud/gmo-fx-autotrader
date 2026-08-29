@@ -6,8 +6,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 
-# config/settings から PORT のインポートを外し、ここで環境変数から取得するように修正
 from config.settings import GEMINI_API_KEY, DISCORD_WEBHOOK_URL, ALLOWED_SYMBOLS, INITIAL_CAPITAL, RISK_RATIO
+from trader.paper_trader import PaperTraderTeam
+from trader.strategy import BasicStrategy
+from analyzer.market_analyzer import MarketAnalyzer
+from analyzer.notifier import WebhookNotifier
 
 PORT = int(os.getenv("PORT", 10000))
 JST = timezone(timedelta(hours=9))
