@@ -1,9 +1,12 @@
 # trader/strategy.py
+import os
+import json
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
 
 JST = timezone(timedelta(hours=9))
+PARAMS_FILE = "config/active_params.json"
 
 class BasicStrategy:
     """
@@ -14,6 +17,9 @@ class BasicStrategy:
         self.long_window = long_window
         self.rsi_window = rsi_window
         self.atr_window = atr_window
+
+        # 起動時に保存済みパラメータが存在すれば自動ロード
+        self.load_parameters()
 
         # サーキットブレーカー管理パラメータ
         self.max_daily_drawdown_ratio = 0.05  # 日次最大許容損失率 5%
@@ -31,15 +37,41 @@ class BasicStrategy:
         }
 
     def update_parameters(self, new_params: dict):
-        """自己成長エンジンからのパラメータ動的適用"""
+        """自己成長エンジンからのパラメータ動的適用 ＆ 永続化保存"""
         old_params = self.get_parameters()
         self.short_window = new_params.get("short_window", self.short_window)
         self.long_window = new_params.get("long_window", self.long_window)
         self.rsi_window = new_params.get("rsi_window", self.rsi_window)
         self.atr_window = new_params.get("atr_window", self.atr_window)
-        print(f"【戦略自己進化】パラメータ更新完了:")
+        
+        # ディスクへ保存
+        self.save_parameters()
+        print(f"【戦略自己進化】パラメータ更新＆永続化完了:")
         print(f"  Old: {old_params}")
         print(f"  New: {self.get_parameters()}")
+
+    def save_parameters(self):
+        """現在のパラメータをJSONファイルへ保存"""
+        try:
+            os.makedirs("config", exist_ok=True)
+            with open(PARAMS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.get_parameters(), f, indent=4)
+        except Exception as e:
+            print(f"【エラー】パラメータの保存に失敗しました: {e}")
+
+    def load_parameters(self):
+        """JSONファイルから保存済みパラメータをロード"""
+        if os.path.exists(PARAMS_FILE):
+            try:
+                with open(PARAMS_FILE, "r", encoding="utf-8") as f:
+                    p = json.load(f)
+                    self.short_window = p.get("short_window", self.short_window)
+                    self.long_window = p.get("long_window", self.long_window)
+                    self.rsi_window = p.get("rsi_window", self.rsi_window)
+                    self.atr_window = p.get("atr_window", self.atr_window)
+                    print(f"【起動処理】復元された最適化パラメータ: {self.get_parameters()}")
+            except Exception as e:
+                print(f"【警告】パラメータ設定のロード失敗（デフォルト値を使用します）: {e}")
 
     def calculate_atr(self, df: pd.DataFrame) -> float:
         """
