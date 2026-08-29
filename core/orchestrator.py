@@ -1,6 +1,7 @@
 # core/orchestrator.py
 import time
 import json
+import traceback
 import threading
 from datetime import datetime, timezone, timedelta
 import pandas as pd
@@ -15,7 +16,7 @@ from analyzer.optimizer import StrategyOptimizer
 from fetcher.gmo_fx import GmoFxFetcher
 from accounting.tax_calculator import TaxCalculator
 from reporter.report_generator import PerformanceReporter
-from utils.logger import logger  # ★ロガーのインポート
+from utils.logger import logger
 
 try:
     import websocket
@@ -48,7 +49,7 @@ def generate_fallback_candle_data(base_price: float, count: int = 30) -> pd.Data
     return pd.DataFrame(data)
 
 class SystemOrchestrator:
-    """システム全体を統合統括する核エンジン（構造化ログ対応版）"""
+    """システム全体を統合統括する核エンジン（死活監視・ハートビート・完全障害耐性版）"""
 
     def __init__(self):
         # 各ユニットの初期化
@@ -72,8 +73,13 @@ class SystemOrchestrator:
         }
         self.cache_lock = threading.Lock()
         self.last_date = datetime.now(JST).strftime("%Y-%m-%d")
+        
+        # タイマー設定
+        self.start_time = time.time()
         self.last_signal_check_time = 0.0
-        self.signal_check_interval = 60.0
+        self.signal_check_interval = 60.0       # 60秒毎にシグナル判定
+        self.last_heartbeat_time = time.time()
+        self.heartbeat_interval = 21600.0        # 6時間（21600秒）毎にハートビート送信
 
     def start_websocket(self):
         """WebSocketリアルタイムレート受信用バックグラウンド処理"""
@@ -113,7 +119,7 @@ class SystemOrchestrator:
             ws.run_forever()
 
     def run_loop(self):
-        """システム全体の統括メインループ"""
+        """システム全体の統括メインループ（例外捕捉・死活監視対応）"""
         logger.info("==========================================")
         logger.info(f" GMOコイン FX 自動トレードシステム起動")
         logger.info(f" 初期資金: {INITIAL_CAPITAL:,.0f}円 | 1トレードリスク比率: {RISK_RATIO*100:.1f}%")
@@ -122,32 +128,65 @@ class SystemOrchestrator:
         threading.Thread(target=self.start_websocket, daemon=True).start()
 
         while True:
-            now_time = time.time()
-            now_jst = datetime.now(JST)
-            current_date = now_jst.strftime("%Y-%m-%d")
+            try:
+                now_time = time.time()
+                now_jst = datetime.now(JST)
+                current_date = now_jst.strftime("%Y-%m-%d")
 
-            with self.cache_lock:
-                current_rates = self.rates_cache.copy()
+                with self.cache_lock:
+                    current_rates = self.rates_cache.copy()
 
-            if not HAS_WEBSOCKET or not current_rates:
-                fetched = self.gmo_fetcher.fetch_ticker()
-                if fetched:
-                    current_rates.update(fetched)
+                if not HAS_WEBSOCKET or not current_rates:
+                    fetched = self.gmo_fetcher.fetch_ticker()
+                    if fetched:
+                        current_rates.update(fetched)
 
-            # ① リアルタイム SL/TP 決済監視
-            self._process_realtime_sl_tp(current_rates)
+                # ① リアルタイム SL/TP 決済監視
+                self._process_realtime_sl_tp(current_rates)
 
-            # ② テクニカル分析 ＆ シグナル評価
-            if now_time - self.last_signal_check_time >= self.signal_check_interval:
-                self.last_signal_check_time = now_time
-                self._process_signal_evaluation(now_jst, current_rates)
+                # ② テクニカル分析 ＆ シグナル評価 (1分周期)
+                if now_time - self.last_signal_check_time >= self.signal_check_interval:
+                    self.last_signal_check_time = now_time
+                    self._process_signal_evaluation(now_jst, current_rates)
 
-            # ③ 日次バッチ（分析・リスク・税務・最適化・報告）
-            if current_date != self.last_date:
-                self._process_daily_reporting(current_rates)
-                self.last_date = current_date
+                # ③ 定期的ハートビート通知 (6時間周期)
+                if now_time - self.last_heartbeat_time >= self.heartbeat_interval:
+                    self.last_heartbeat_time = now_time
+                    self._send_heartbeat()
 
-            time.sleep(1)
+                # ④ 日次バッチ（分析・リスク・税務・最適化・報告）
+                if current_date != self.last_date:
+                    self._process_daily_reporting(current_rates)
+                    self.last_date = current_date
+
+                time.sleep(1)
+
+            except Exception as e:
+                err_trace = traceback.format_exc()
+                logger.critical(f"【メインループ致命的エラー】: {e}\n{err_trace}")
+                # Discordへ緊急アラート送信
+                self.notifier.notify_system_error(err_trace)
+                # ループ破綻防止のための待機（連続エラーによる負荷高騰を防止）
+                time.sleep(10)
+
+    def _send_heartbeat(self):
+        """死活監視用ハートビート情報の作成とDiscord通知"""
+        uptime_seconds = int(time.time() - self.start_time)
+        hours, remainder = divmod(uptime_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_str = f"{hours}時間{minutes}分{seconds}秒"
+
+        open_positions_count = len(self.trader.positions) if hasattr(self.trader.positions, "__len__") else 0
+
+        status_info = {
+            "uptime": uptime_str,
+            "balance": self.trader.portfolio.balance,
+            "open_positions": open_positions_count,
+            "params": self.strategy.get_parameters(),
+            "cb_triggered": self.strategy.circuit_breaker_triggered
+        }
+        logger.info(f"【死活監視】ハートビート通知を送信します。稼働時間: {uptime_str}")
+        self.notifier.notify_heartbeat(status_info)
 
     def _process_realtime_sl_tp(self, current_rates: dict):
         """保持ポジションの1秒毎SL/TP自動決済判定"""
