@@ -1,65 +1,135 @@
+# trader/strategy.py
 import pandas as pd
 import numpy as np
-from typing import Dict, Any
+from datetime import datetime, timezone, timedelta
 
-class TechnicalAnalysis:
-    @staticmethod
-    def calculate_sma(df: pd.DataFrame, column: str = "close", window: int = 20) -> pd.Series:
-        return df[column].rolling(window=window).mean()
-
-    @staticmethod
-    def calculate_rsi(df: pd.DataFrame, column: str = "close", window: int = 14) -> pd.Series:
-        delta = df[column].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+JST = timezone(timedelta(hours=9))
 
 class BasicStrategy:
-    def __init__(self, short_window: int = 5, long_window: int = 20, rsi_window: int = 14):
+    """
+    テクニカル指標 (SMA + RSI + ATR) 及び動的リスク管理戦略
+    """
+    def __init__(self, short_window: int = 5, long_window: int = 20, rsi_window: int = 14, atr_window: int = 14):
         self.short_window = short_window
         self.long_window = long_window
         self.rsi_window = rsi_window
+        self.atr_window = atr_window
 
-    def generate_signal(self, df: pd.DataFrame) -> Dict[str, Any]:
-        if len(df) < self.long_window + 1:
-            return {"signal": "HOLD", "reason": "データ数不足"}
+        # サーキットブレーカー管理パラメータ
+        self.max_daily_drawdown_ratio = 0.05  # 日次最大許容損失率 5%
+        self.initial_daily_balance = None
+        self.circuit_breaker_triggered = False
+        self.last_reset_date = None
 
-        df["sma_short"] = TechnicalAnalysis.calculate_sma(df, "close", self.short_window)
-        df["sma_long"] = TechnicalAnalysis.calculate_sma(df, "close", self.long_window)
-        df["rsi"] = TechnicalAnalysis.calculate_rsi(df, "close", self.rsi_window)
+    def calculate_atr(self, df: pd.DataFrame) -> float:
+        """
+        ATR (Average True Range) の計算
+        """
+        if len(df) < self.atr_window + 1:
+            return 0.10  # デフォルト値 (10ピップス相当)
 
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
+        high = df['high']
+        low = df['low']
+        close_prev = df['close'].shift(1)
+
+        tr1 = high - low
+        tr2 = (high - close_prev).abs()
+        tr3 = (low - close_prev).abs()
+
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=self.atr_window).mean().iloc[-1]
+        return float(atr) if not np.isnan(atr) and atr > 0 else 0.10
+
+    def generate_signal(self, df: pd.DataFrame) -> dict:
+        """
+        シグナル生成 + ATR動的SL/TPの算出
+        """
+        if self.circuit_breaker_triggered:
+            return {"signal": "HOLD", "reason": "Circuit Breaker Active (Daily Max Loss Reached)", "sl_price": None, "tp_price": None, "atr": 0.0}
+
+        if len(df) < self.long_window:
+            return {"signal": "HOLD", "reason": "Insufficient Data", "sl_price": None, "tp_price": None, "atr": 0.0}
+
+        df['sma_short'] = df['close'].rolling(window=self.short_window).mean()
+        df['sma_long'] = df['close'].rolling(window=self.long_window).mean()
+
+        # RSI計算
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=self.rsi_window).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=self.rsi_window).mean()
+        rs = gain / loss.replace(0, np.nan)
+        df['rsi'] = 100 - (100 / (1 + rs))
+
+        curr_close = df['close'].iloc[-1]
+        curr_short = df['sma_short'].iloc[-1]
+        curr_long = df['sma_long'].iloc[-1]
+        prev_short = df['sma_short'].iloc[-2]
+        prev_long = df['sma_long'].iloc[-2]
+        curr_rsi = df['rsi'].iloc[-1] if not np.isnan(df['rsi'].iloc[-1]) else 50.0
+
+        atr = self.calculate_atr(df)
 
         signal = "HOLD"
-        reason = "シグナルなし"
+        reason = f"SMA_S:{curr_short:.2f}, SMA_L:{curr_long:.2f}, RSI:{curr_rsi:.1f}"
 
-        if (prev["sma_short"] <= prev["sma_long"]) and (curr["sma_short"] > curr["sma_long"]):
-            if curr["rsi"] < 70:
-                signal = "BUY"
-                reason = f"SMAゴールデンクロス達成 (RSI: {curr['rsi']:.1f})"
-            else:
-                reason = f"GC達成もRSI高値警戒 (RSI: {curr['rsi']:.1f})"
-        elif (prev["sma_short"] >= prev["sma_long"]) and (curr["sma_short"] < curr["sma_long"]):
-            if curr["rsi"] > 30:
-                signal = "SELL"
-                reason = f"SMAデッドクロス達成 (RSI: {curr['rsi']:.1f})"
-            else:
-                reason = f"DC達成もRSI安値警戒 (RSI: {curr['rsi']:.1f})"
+        # ゴールデンクロス & RSI過熱感チェック
+        if prev_short <= prev_long and curr_short > curr_long and curr_rsi < 70:
+            signal = "BUY"
+            reason = f"Golden Cross Detected (RSI: {curr_rsi:.1f})"
+        # デッドクロス & RSI売られすぎチェック
+        elif prev_short >= prev_long and curr_short < curr_long and curr_rsi > 30:
+            signal = "SELL"
+            reason = f"Dead Cross Detected (RSI: {curr_rsi:.1f})"
+
+        # ATRに基づく可変ストップロス(1.5x ATR) / テイクプロフィット(3.0x ATR)
+        sl_price, tp_price = None, None
+        if signal == "BUY":
+            sl_price = round(curr_close - (atr * 1.5), 3)
+            tp_price = round(curr_close + (atr * 3.0), 3)
+        elif signal == "SELL":
+            sl_price = round(curr_close + (atr * 1.5), 3)
+            tp_price = round(curr_close - (atr * 3.0), 3)
 
         return {
             "signal": signal,
             "reason": reason,
-            "price": curr["close"],
-            "sma_short": round(curr["sma_short"], 3),
-            "sma_long": round(curr["sma_long"], 3),
-            "rsi": round(curr["rsi"], 2)
+            "atr": atr,
+            "sl_price": sl_price,
+            "tp_price": tp_price
         }
 
-    @staticmethod
-    def calculate_position_size(balance: float, price: float, risk_ratio: float = 0.02, min_size: int = 100) -> float:
-        max_margin = balance * risk_ratio
-        max_amount = (max_margin / (price * 0.05))
-        amount = int(max_amount // min_size) * min_size
-        return float(max(amount, min_size))
+    def calculate_position_size(self, balance: float, entry_price: float, risk_ratio: float, atr: float = 0.10) -> int:
+        """
+        定率リスクモデル（Fixed Fractional Risk）に基づく建玉数量計算
+        リスク許容額 = 口座残高 * risk_ratio
+        損切り幅 = ATR * 1.5
+        """
+        if balance <= 0 or entry_price <= 0:
+            return 0
+
+        risk_amount = balance * risk_ratio
+        sl_distance = max(atr * 1.5, 0.05)  # 最小5ピップスは確保
+
+        # 1通貨あたりの損失額(円) = sl_distance
+        raw_units = risk_amount / sl_distance
+        
+        # GMOコイン FXの最小取引単位: 100通貨単位で丸め
+        units = int(raw_units // 100) * 100
+        return max(units, 100)  # 最低100通貨
+
+    def check_circuit_breaker(self, current_balance: float) -> bool:
+        """
+        日次サーキットブレーカーチェック
+        """
+        today_str = datetime.now(JST).strftime("%Y-%m-%d")
+        if self.last_reset_date != today_str:
+            self.initial_daily_balance = current_balance
+            self.circuit_breaker_triggered = False
+            self.last_reset_date = today_str
+
+        if self.initial_daily_balance and self.initial_daily_balance > 0:
+            drawdown = (self.initial_daily_balance - current_balance) / self.initial_daily_balance
+            if drawdown >= self.max_daily_drawdown_ratio:
+                self.circuit_breaker_triggered = True
+
+        return self.circuit_breaker_triggered
