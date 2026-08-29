@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+
+# Environment variables (API Key & Webhook)
+.env
+
+# Jupyter / Colab
+.ipynb_checkpoints/
