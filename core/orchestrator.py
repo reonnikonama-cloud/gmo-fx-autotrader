@@ -148,7 +148,10 @@ class SystemOrchestrator:
 
     def _process_realtime_sl_tp(self, current_rates: dict):
         """保持ポジションの1秒毎SL/TP自動決済判定"""
-        for pos_id, pos in list(self.trader.positions.items()):
+        positions = self.trader.positions
+        pos_items = positions.items() if hasattr(positions, "items") else enumerate(positions)
+
+        for pos_id, pos in list(pos_items):
             sym = pos["symbol"]
             if sym not in current_rates: continue
             bid, ask = current_rates[sym]["bid"], current_rates[sym]["ask"]
@@ -198,8 +201,11 @@ class SystemOrchestrator:
                 )
                 order_res = self.trader.place_order(symbol, sig, amount, current_rates)
                 if order_res["status"] == "ACCEPTED":
-                    for pos_id, pos in self.trader.positions.items():
-                        if pos.get("sl") is None:
+                    # リスト型・辞書型の両対応で SL/TP を書き込み
+                    positions = self.trader.positions
+                    pos_items = positions.items() if hasattr(positions, "items") else enumerate(positions)
+                    for pos_id, pos in list(pos_items):
+                        if pos.get("symbol") == symbol and pos.get("sl") is None:
                             pos["sl"] = analysis["sl_price"]
                             pos["tp"] = analysis["tp_price"]
 
