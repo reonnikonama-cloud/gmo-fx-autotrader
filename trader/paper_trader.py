@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from trader.gmo_rules import GMORuleValidator
 
 JST = timezone(timedelta(hours=9))
@@ -33,10 +33,59 @@ class PaperTraderTeam:
             "side": side,
             "amount": amount,
             "price": price,
+            "entry_price": price,
+            "sl": None,
+            "tp": None,
             "timestamp": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
         }
         self.positions.append(position)
         return {"status": "ACCEPTED", "id": pos_id, "price": price, "fee": round(fee, 2)}
+
+    def close_position(self, pos_id: Any, exit_price: float) -> Dict[str, Any]:
+        """指定したポジションを決済し、損益計算・残高更新・履歴保存を行う"""
+        pos_idx: Optional[int] = None
+        
+        # ID検索（文字列UUID / リストインデックス数値の両方に対応）
+        if isinstance(pos_id, int) and 0 <= pos_id < len(self.positions):
+            pos_idx = pos_id
+        else:
+            for idx, p in enumerate(self.positions):
+                if str(p.get("id")) == str(pos_id):
+                    pos_idx = idx
+                    break
+
+        if pos_idx is None:
+            return {"status": "NOT_FOUND", "pnl": 0.0}
+
+        pos = self.positions.pop(pos_idx)
+        side = pos.get("side", "BUY")
+        amount = pos.get("amount", 0.0)
+        entry_price = pos.get("price", pos.get("entry_price", exit_price))
+
+        # 確定損益計算 (BUY: (Exit - Entry) * Amount, SELL: (Entry - Exit) * Amount)
+        if side == "BUY":
+            pnl = (exit_price - entry_price) * amount
+        else:
+            pnl = (entry_price - exit_price) * amount
+
+        # 口座残高および実現損益の更新
+        self.portfolio.balance += pnl
+        self.portfolio.realized_pnl += pnl
+
+        # 取引履歴の追加
+        trade_record = {
+            "id": pos.get("id"),
+            "symbol": pos.get("symbol"),
+            "side": f"CLOSE_{side}",
+            "amount": amount,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "pnl": pnl,
+            "timestamp": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self.trade_history.append(trade_record)
+
+        return {"status": "CLOSED", "pnl": pnl, "trade_record": trade_record}
 
     def process_account_health_and_losscut(self, rates: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
         total_unrealized_pnl = 0.0
@@ -64,7 +113,19 @@ class PaperTraderTeam:
             losscut_executed = True
             losscut_fee = total_units * GMORuleValidator.LOSSCUT_FEE_PER_UNIT
             losscut_loss = total_unrealized_pnl
-            self.portfolio.balance += (total_unrealized_pnl - losscut_fee)
+            net_loss = total_unrealized_pnl - losscut_fee
+
+            self.portfolio.balance += net_loss
+            self.portfolio.realized_pnl += net_loss
+
+            self.trade_history.append({
+                "symbol": "ALL",
+                "side": "LOSSCUT",
+                "amount": total_units,
+                "pnl": net_loss,
+                "timestamp": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+            })
+
             self.positions.clear()
             margin_ratio = 0.0
 
@@ -85,7 +146,9 @@ class PaperTraderTeam:
         return {
             "date": date_str,
             "balance": round(self.portfolio.balance, 1),
+            "ending_balance": round(self.portfolio.balance, 1),
             "realized_pnl": round(self.portfolio.realized_pnl, 1),
+            "trades_count": total_trades,
             "total_trades": total_trades,
             "win_rate": round(win_rate, 1)
         }
