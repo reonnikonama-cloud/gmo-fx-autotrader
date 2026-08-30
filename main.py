@@ -1,13 +1,15 @@
 import os
+import sys
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from core.orchestrator import SystemOrchestrator
+from utils.logger import logger
 
 PORT = int(os.getenv("PORT", 10000))
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def _send_ok(self):
-        """常に最小限のレスポンス (2 bytes) を返却"""
+        """ヘルスチェック用レスポンス"""
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", "2")
@@ -32,12 +34,21 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 def run_health_check_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    logger.info(f"ヘルスチェックサーバーをポート {PORT} で起動しました。")
     server.serve_forever()
 
 if __name__ == "__main__":
-    # Renderヘルスチェックおよび cron-job.org 用HTTPサーバーの並行起動
-    threading.Thread(target=run_health_check_server, daemon=True).start()
+    # ヘルスチェックサーバーの並行起動
+    health_thread = threading.Thread(target=run_health_check_server, daemon=True)
+    health_thread.start()
 
-    # 全モジュールを統括するオーケストレーターの実行
-    orchestrator = SystemOrchestrator()
-    orchestrator.run_loop()
+    # メインオーケストレーター実行
+    try:
+        orchestrator = SystemOrchestrator()
+        orchestrator.run_loop()
+    except KeyboardInterrupt:
+        logger.info("ユーザー操作によりシステムを終了します。")
+        sys.exit(0)
+    except Exception as e:
+        logger.critical(f"システム停止エラー: {e}")
+        sys.exit(1)
