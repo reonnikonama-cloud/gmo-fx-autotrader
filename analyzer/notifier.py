@@ -1,10 +1,10 @@
-# analyzer/notifier.py
-import requests
+import time
 import json
+import requests
 from utils.logger import logger
 
 class WebhookNotifier:
-    """Discord Webhookを使用した各種通知モジュール（死活監視・ハートビート対応版）"""
+    """Discord Webhookを使用した各種通知モジュール（死活監視・ハートビート・リトライ対応版）"""
 
     def __init__(self, webhook_url: str):
         self.webhook_url = webhook_url
@@ -14,34 +14,52 @@ class WebhookNotifier:
             logger.warning("Discord Webhook URLが未設定のため通知をスキップしました。")
             return False
 
-        try:
-            payload = {"content": content}
-            headers = {"Content-Type": "application/json"}
-            res = requests.post(self.webhook_url, data=json.dumps(payload), headers=headers, timeout=10)
-            if res.status_code in [200, 204]:
-                return True
-            else:
-                logger.error(f"Discord通知失敗: Status {res.status_code}, Response: {res.text}")
-                return False
-        except Exception as e:
-            logger.error(f"Discord Webhook送信エラー: {e}")
-            return False
+        payload = {"content": content}
+        headers = {"Content-Type": "application/json"}
+
+        # 簡易リトライロジック (最大3回)
+        for attempt in range(3):
+            try:
+                res = requests.post(
+                    self.webhook_url,
+                    data=json.dumps(payload),
+                    headers=headers,
+                    timeout=10
+                )
+                if res.status_code in [200, 204]:
+                    return True
+                elif res.status_code == 429:
+                    # レートリミット時の待機
+                    retry_after = res.json().get("retry_after", 2000) / 1000.0
+                    logger.warning(f"Discord Webhook レート制限適用中。{retry_after:.1f}秒待機します...")
+                    time.sleep(retry_after)
+                    continue
+                else:
+                    logger.error(f"Discord通知失敗: Status {res.status_code}, Response: {res.text}")
+                    return False
+            except Exception as e:
+                logger.error(f"Discord Webhook送信エラー (試行 {attempt + 1}/3): {e}")
+                time.sleep(2)
+        return False
 
     def notify_trade_executed(self, trade_info: dict):
-        side_emoji = "🟢" if "BUY" in trade_info["side"] else "🔴" if "SELL" in trade_info["side"] else "⚪"
+        side = trade_info.get("side", "")
+        side_emoji = "🟢" if "BUY" in side else "🔴" if "SELL" in side else "⚪"
+        
         msg = (
-            f"{side_emoji} **【約定通知】** [{trade_info['symbol']}]\n"
-            f"・種別: {trade_info['side']}\n"
-            f"・数量: {trade_info['amount']:,} 通貨\n"
-            f"・価格: {trade_info['price']:.3f}\n"
+            f"{side_emoji} **【約定通知】** [{trade_info.get('symbol', 'UNKNOWN')}]\n"
+            f"・種別: {side}\n"
+            f"・数量: {trade_info.get('amount', 0):,} 通貨\n"
+            f"・価格: {trade_info.get('price', 0.0):.3f}\n"
         )
-        if "sl" in trade_info and trade_info["sl"]:
+        if trade_info.get("sl"):
             msg += f"・SL (損切): {trade_info['sl']:.3f}\n"
-        if "tp" in trade_info and trade_info["tp"]:
+        if trade_info.get("tp"):
             msg += f"・TP (利確): {trade_info['tp']:.3f}\n"
         if "pnl" in trade_info:
-            pnl_emoji = "🎉" if trade_info["pnl"] >= 0 else "💸"
-            msg += f"・確定損益: {pnl_emoji} {trade_info['pnl']:,.0f} 円\n"
+            pnl = trade_info["pnl"]
+            pnl_emoji = "🎉" if pnl >= 0 else "💸"
+            msg += f"・確定損益: {pnl_emoji} {pnl:,.0f} 円\n"
 
         self.send_message(msg)
 
