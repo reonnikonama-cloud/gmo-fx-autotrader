@@ -4,20 +4,18 @@ import requests
 from utils.logger import logger
 
 class WebhookNotifier:
-    """Discord Webhookを使用した各種通知モジュール（死活監視・ハートビート・リトライ対応版）"""
+    """Discord Webhookを使用した各種通知モジュール（Embed対応・リトライ・レート制限制御）"""
 
     def __init__(self, webhook_url: str):
         self.webhook_url = webhook_url
 
-    def send_message(self, content: str) -> bool:
+    def _post_payload(self, payload: dict) -> bool:
         if not self.webhook_url or self.webhook_url.startswith("YOUR_"):
             logger.warning("Discord Webhook URLが未設定のため通知をスキップしました。")
             return False
 
-        payload = {"content": content}
         headers = {"Content-Type": "application/json"}
 
-        # 簡易リトライロジック (最大3回)
         for attempt in range(3):
             try:
                 res = requests.post(
@@ -29,7 +27,6 @@ class WebhookNotifier:
                 if res.status_code in [200, 204]:
                     return True
                 elif res.status_code == 429:
-                    # レートリミット時の待機
                     retry_after = res.json().get("retry_after", 2000) / 1000.0
                     logger.warning(f"Discord Webhook レート制限適用中。{retry_after:.1f}秒待機します...")
                     time.sleep(retry_after)
@@ -41,6 +38,23 @@ class WebhookNotifier:
                 logger.error(f"Discord Webhook送信エラー (試行 {attempt + 1}/3): {e}")
                 time.sleep(2)
         return False
+
+    def send_message(self, content: str) -> bool:
+        return self._post_payload({"content": content})
+
+    def send_embed(self, title: str, description: str, fields: list, color: int = 3066993) -> bool:
+        """DailyBatchProcessor 用の Embed 形式通知"""
+        payload = {
+            "embeds": [
+                {
+                    "title": title,
+                    "description": description,
+                    "fields": fields,
+                    "color": color
+                }
+            ]
+        }
+        return self._post_payload(payload)
 
     def notify_trade_executed(self, trade_info: dict):
         side = trade_info.get("side", "")
@@ -68,7 +82,6 @@ class WebhookNotifier:
         self.send_message(msg)
 
     def notify_heartbeat(self, status_info: dict):
-        """定期的（6時間ごと）なシステム生死確認（ハートビート）通知"""
         msg = (
             f"💓 **【システム死活監視 - ハートビート】**\n"
             f"・ステータス: 🟢 正常稼働中 (Active)\n"
@@ -81,10 +94,12 @@ class WebhookNotifier:
         self.send_message(msg)
 
     def notify_system_error(self, error_msg: str):
-        """緊急事態・未捕捉エラー発生時の即時通知"""
         msg = (
             f"🚨 **【緊急アラート】システム異常・未捕捉例外発生**\n"
             f"```\n{error_msg[:1800]}\n```\n"
             f"※ 詳細はサーバー内のログファイル `logs/app.log` を確認してください。"
         )
         self.send_message(msg)
+
+# クラス名のエイリアスを設定（既存と新規の呼び出し差異を吸収）
+DiscordNotifier = WebhookNotifier
