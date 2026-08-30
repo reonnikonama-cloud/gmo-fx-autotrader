@@ -1,4 +1,3 @@
-# core/orchestrator.py
 import time
 import json
 import traceback
@@ -52,7 +51,6 @@ class SystemOrchestrator:
     """システム全体を統合統括する核エンジン（死活監視・ハートビート・完全障害耐性版）"""
 
     def __init__(self):
-        # 各ユニットの初期化
         self.trader = PaperTraderTeam(initial_capital=INITIAL_CAPITAL)
         self.strategy = BasicStrategy(short_window=5, long_window=20, rsi_window=14, atr_window=14)
         self.market_analyzer = MarketAnalyzer(api_key=GEMINI_API_KEY)
@@ -63,7 +61,6 @@ class SystemOrchestrator:
         self.gmo_fetcher = GmoFxFetcher()
         self.optimizer = StrategyOptimizer(initial_capital=INITIAL_CAPITAL)
 
-        # キャッシュ・同期変数
         self.rates_cache = {
             "USD_JPY": {"bid": 155.500, "ask": 155.515},
             "EUR_JPY": {"bid": 168.200, "ask": 168.215},
@@ -74,15 +71,20 @@ class SystemOrchestrator:
         self.cache_lock = threading.Lock()
         self.last_date = datetime.now(JST).strftime("%Y-%m-%d")
         
-        # タイマー設定
         self.start_time = time.time()
         self.last_signal_check_time = 0.0
-        self.signal_check_interval = 60.0       # 60秒毎にシグナル判定
+        self.signal_check_interval = 60.0
         self.last_heartbeat_time = time.time()
-        self.heartbeat_interval = 21600.0        # 6時間（21600秒）毎にハートビート送信
+        self.heartbeat_interval = 21600.0  # 6時間
 
     def start_websocket(self):
-        """WebSocketリアルタイムレート受信用バックグラウンド処理"""
+        """WebSocketリアルタイムレート受信用バックグラウンド処理 (ループ自動再接続対応)"""
+        if not HAS_WEBSOCKET:
+            logger.warning("websocket-client ライブラリ未導入のため HTTP ポーリングにフォールバックします。")
+            return
+
+        ws_url = "wss://forex-api.coin.z.com/ws/public/v1"
+
         def on_message(ws, message):
             try:
                 data = json.loads(message)
@@ -102,24 +104,30 @@ class SystemOrchestrator:
                 sub_msg = {"command": "subscribe", "channel": "ticker", "symbol": sym}
                 ws.send(json.dumps(sub_msg))
 
-        def on_close(ws, close_status_code, close_msg):
-            logger.warning(f"WebSocket切断検出 ({close_status_code}: {close_msg})。5秒後に再接続します...")
-            time.sleep(5)
-            threading.Thread(target=self.start_websocket, daemon=True).start()
+        def on_error(ws, e):
+            logger.error(f"WebSocketエラー: {e}")
 
-        if HAS_WEBSOCKET:
-            ws_url = "wss://forex-api.coin.z.com/ws/public/v1"
-            ws = websocket.WebSocketApp(
-                ws_url,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=lambda ws, e: logger.error(f"WebSocketエラー: {e}"),
-                on_close=on_close
-            )
-            ws.run_forever()
+        def on_close(ws, close_status_code, close_msg):
+            logger.warning(f"WebSocket切断検出 ({close_status_code}: {close_msg})。")
+
+        while True:
+            try:
+                ws = websocket.WebSocketApp(
+                    ws_url,
+                    on_open=on_open,
+                    on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close
+                )
+                ws.run_forever()
+            except Exception as e:
+                logger.error(f"WebSocketループ例外発生: {e}")
+            
+            logger.info("5秒後にWebSocket再接続を試みます...")
+            time.sleep(5)
 
     def run_loop(self):
-        """システム全体の統括メインループ（例外捕捉・死活監視対応）"""
+        """システム全体の統括メインループ"""
         logger.info("==========================================")
         logger.info(f" GMOコイン FX 自動トレードシステム起動")
         logger.info(f" 初期資金: {INITIAL_CAPITAL:,.0f}円 | 1トレードリスク比率: {RISK_RATIO*100:.1f}%")
@@ -154,7 +162,7 @@ class SystemOrchestrator:
                     self.last_heartbeat_time = now_time
                     self._send_heartbeat()
 
-                # ④ 日次バッチ（分析・リスク・税務・最適化・報告）
+                # ④ 日次バッチ
                 if current_date != self.last_date:
                     self._process_daily_reporting(current_rates)
                     self.last_date = current_date
@@ -164,13 +172,10 @@ class SystemOrchestrator:
             except Exception as e:
                 err_trace = traceback.format_exc()
                 logger.critical(f"【メインループ致命的エラー】: {e}\n{err_trace}")
-                # Discordへ緊急アラート送信
                 self.notifier.notify_system_error(err_trace)
-                # ループ破綻防止のための待機（連続エラーによる負荷高騰を防止）
                 time.sleep(10)
 
     def _send_heartbeat(self):
-        """死活監視用ハートビート情報の作成とDiscord通知"""
         uptime_seconds = int(time.time() - self.start_time)
         hours, remainder = divmod(uptime_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
@@ -188,14 +193,20 @@ class SystemOrchestrator:
         logger.info(f"【死活監視】ハートビート通知を送信します。稼働時間: {uptime_str}")
         self.notifier.notify_heartbeat(status_info)
 
-    def _process_realtime_sl_tp(self, current_rates: dict):
-        """保持ポジションの1秒毎SL/TP自動決済判定"""
+    def _get_position_iterator(self):
         positions = self.trader.positions
-        pos_items = positions.items() if hasattr(positions, "items") else enumerate(positions)
+        if isinstance(positions, dict):
+            return list(positions.items())
+        elif isinstance(positions, list):
+            return list(enumerate(positions))
+        return []
 
-        for pos_id, pos in list(pos_items):
-            sym = pos["symbol"]
-            if sym not in current_rates: continue
+    def _process_realtime_sl_tp(self, current_rates: dict):
+        for pos_id, pos in self._get_position_iterator():
+            sym = pos.get("symbol")
+            if not sym or sym not in current_rates:
+                continue
+
             bid, ask = current_rates[sym]["bid"], current_rates[sym]["ask"]
             curr_price = bid if pos["side"] == "BUY" else ask
 
@@ -203,11 +214,15 @@ class SystemOrchestrator:
             close_reason = None
 
             if pos["side"] == "BUY":
-                if sl and curr_price <= sl: close_reason = f"SL到達 ({curr_price:.3f} <= {sl})"
-                elif tp and curr_price >= tp: close_reason = f"TP到達 ({curr_price:.3f} >= {tp})"
+                if sl and curr_price <= sl:
+                    close_reason = f"SL到達 ({curr_price:.3f} <= {sl})"
+                elif tp and curr_price >= tp:
+                    close_reason = f"TP到達 ({curr_price:.3f} >= {tp})"
             elif pos["side"] == "SELL":
-                if sl and curr_price >= sl: close_reason = f"SL到達 ({curr_price:.3f} >= {sl})"
-                elif tp and curr_price <= tp: close_reason = f"TP到達 ({curr_price:.3f} <= {tp})"
+                if sl and curr_price >= sl:
+                    close_reason = f"SL到達 ({curr_price:.3f} >= {sl})"
+                elif tp and curr_price <= tp:
+                    close_reason = f"TP到達 ({curr_price:.3f} <= {tp})"
 
             if close_reason:
                 res = self.trader.close_position(pos_id, curr_price)
@@ -218,14 +233,15 @@ class SystemOrchestrator:
                 })
 
     def _process_signal_evaluation(self, now_jst: datetime, current_rates: dict):
-        """シグナル評価と注文執行"""
         logger.info(f"--- レート更新 & シグナル評価 ({now_jst.strftime('%H:%M:%S')}) ---")
 
         if self.strategy.check_circuit_breaker(self.trader.portfolio.balance):
             logger.warning("【サーキットブレーカー発動中】日次許容損失上限（5%）到達のため新規注文停止中")
 
         for symbol in ALLOWED_SYMBOLS:
-            if symbol not in current_rates: continue
+            if symbol not in current_rates:
+                continue
+
             current_ask, current_bid = current_rates[symbol]["ask"], current_rates[symbol]["bid"]
 
             df_candles = self.gmo_fetcher.fetch_klines(symbol, interval="15min")
@@ -242,26 +258,25 @@ class SystemOrchestrator:
                     self.trader.portfolio.balance, current_ask if sig == "BUY" else current_bid, RISK_RATIO, atr
                 )
                 order_res = self.trader.place_order(symbol, sig, amount, current_rates)
-                if order_res["status"] == "ACCEPTED":
-                    positions = self.trader.positions
-                    pos_items = positions.items() if hasattr(positions, "items") else enumerate(positions)
-                    for pos_id, pos in list(pos_items):
+                
+                if order_res.get("status") == "ACCEPTED":
+                    # 新規追加されたポジションに SL/TP を付与
+                    for pos_id, pos in self._get_position_iterator():
                         if pos.get("symbol") == symbol and pos.get("sl") is None:
-                            pos["sl"] = analysis["sl_price"]
-                            pos["tp"] = analysis["tp_price"]
+                            pos["sl"] = analysis.get("sl_price")
+                            pos["tp"] = analysis.get("tp_price")
 
-                    logger.info(f"  └> 【約定成功】{sig} {amount:,} 通貨 (価格: {order_res['price']:.3f}, SL: {analysis['sl_price']}, TP: {analysis['tp_price']})")
+                    logger.info(f"  └> 【約定成功】{sig} {amount:,} 通貨 (価格: {order_res['price']:.3f}, SL: {analysis.get('sl_price')}, TP: {analysis.get('tp_price')})")
                     self.notifier.notify_trade_executed({
                         "symbol": symbol, "side": sig, "amount": amount,
-                        "price": order_res["price"], "fee": order_res["fee"],
-                        "sl": analysis['sl_price'], "tp": analysis['tp_price']
+                        "price": order_res["price"], "fee": order_res.get("fee", 0),
+                        "sl": analysis.get('sl_price'), "tp": analysis.get('tp_price')
                     })
 
         health = self.trader.process_account_health_and_losscut(current_rates)
-        logger.info(f"口座残高: {self.trader.portfolio.balance:,.0f}円 | 維持率: {health['margin_ratio']}% | 含み損益: {health['unrealized_pnl']:,.0f}円")
+        logger.info(f"口座残高: {self.trader.portfolio.balance:,.0f}円 | 維持率: {health.get('margin_ratio', 'N/A')}% | 含み損益: {health.get('unrealized_pnl', 0):,.0f}円")
 
     def _process_daily_reporting(self, current_rates: dict):
-        """日次バッチ処理"""
         logger.info("==========================================")
         logger.info(" 日次バッチ処理 ＆ 戦略自己成長（パラメータ最適化）開始")
         logger.info("==========================================")
