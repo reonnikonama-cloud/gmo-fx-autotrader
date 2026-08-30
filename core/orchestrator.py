@@ -10,11 +10,12 @@ from trader.paper_trader import PaperTraderTeam
 from trader.strategy import BasicStrategy
 from analyzer.market_analyzer import MarketAnalyzer
 from analyzer.risk_analyzer import RiskAnalyzer
-from analyzer.notifier import WebhookNotifier
+from analyzer.notifier import DiscordNotifier
 from analyzer.optimizer import StrategyOptimizer
 from fetcher.gmo_fx import GmoFxFetcher
 from accounting.tax_calculator import TaxCalculator
 from reporter.report_generator import PerformanceReporter
+from reporter.daily_batch import DailyBatchProcessor
 from utils.logger import logger
 
 try:
@@ -48,7 +49,7 @@ def generate_fallback_candle_data(base_price: float, count: int = 30) -> pd.Data
     return pd.DataFrame(data)
 
 class SystemOrchestrator:
-    """システム全体を統合統括する核エンジン（死活監視・ハートビート・完全障害耐性版）"""
+    """システム全体を統合統括する核エンジン（JST 06:00 取引日バッチ統合版）"""
 
     def __init__(self):
         self.trader = PaperTraderTeam(initial_capital=INITIAL_CAPITAL)
@@ -57,9 +58,12 @@ class SystemOrchestrator:
         self.risk_analyzer = RiskAnalyzer()
         self.tax_calculator = TaxCalculator()
         self.reporter = PerformanceReporter()
-        self.notifier = WebhookNotifier(webhook_url=DISCORD_WEBHOOK_URL)
+        self.notifier = DiscordNotifier(webhook_url=DISCORD_WEBHOOK_URL)
         self.gmo_fetcher = GmoFxFetcher()
         self.optimizer = StrategyOptimizer(initial_capital=INITIAL_CAPITAL)
+        
+        # 新規コンポーネント: JST 06:00 切り替え用日次バッチプロセッサ
+        self.daily_batch_processor = DailyBatchProcessor(notifier=self.notifier)
 
         self.rates_cache = {
             "USD_JPY": {"bid": 155.500, "ask": 155.515},
@@ -69,7 +73,6 @@ class SystemOrchestrator:
             "NZD_JPY": {"bid": 94.100, "ask": 94.115}
         }
         self.cache_lock = threading.Lock()
-        self.last_date = datetime.now(JST).strftime("%Y-%m-%d")
         
         self.start_time = time.time()
         self.last_signal_check_time = 0.0
@@ -78,7 +81,6 @@ class SystemOrchestrator:
         self.heartbeat_interval = 21600.0  # 6時間
 
     def start_websocket(self):
-        """WebSocketリアルタイムレート受信用バックグラウンド処理 (ループ自動再接続対応)"""
         if not HAS_WEBSOCKET:
             logger.warning("websocket-client ライブラリ未導入のため HTTP ポーリングにフォールバックします。")
             return
@@ -127,7 +129,6 @@ class SystemOrchestrator:
             time.sleep(5)
 
     def run_loop(self):
-        """システム全体の統括メインループ"""
         logger.info("==========================================")
         logger.info(f" GMOコイン FX 自動トレードシステム起動")
         logger.info(f" 初期資金: {INITIAL_CAPITAL:,.0f}円 | 1トレードリスク比率: {RISK_RATIO*100:.1f}%")
@@ -139,7 +140,6 @@ class SystemOrchestrator:
             try:
                 now_time = time.time()
                 now_jst = datetime.now(JST)
-                current_date = now_jst.strftime("%Y-%m-%d")
 
                 with self.cache_lock:
                     current_rates = self.rates_cache.copy()
@@ -162,10 +162,8 @@ class SystemOrchestrator:
                     self.last_heartbeat_time = now_time
                     self._send_heartbeat()
 
-                # ④ 日次バッチ
-                if current_date != self.last_date:
-                    self._process_daily_reporting(current_rates)
-                    self.last_date = current_date
+                # ④ 日次バッチ実行（JST 06:00切り替え判定）
+                self.daily_batch_processor.run_daily_batch_if_needed(self._fetch_daily_stats_and_optimize)
 
                 time.sleep(1)
 
@@ -174,6 +172,38 @@ class SystemOrchestrator:
                 logger.critical(f"【メインループ致命的エラー】: {e}\n{err_trace}")
                 self.notifier.notify_system_error(err_trace)
                 time.sleep(10)
+
+    def _fetch_daily_stats_and_optimize(self, target_date: str) -> dict:
+        """DailyBatchProcessorから呼び出されるデータ抽出・パラメータ最適化処理"""
+        logger.info("==========================================")
+        logger.info(f" 日次バッチ処理 ＆ 戦略最適化実行 [対象取引日: {target_date}]")
+        logger.info("==========================================")
+
+        # 1. バックテスト＆パラメータ最適化
+        historical_data = {}
+        for symbol in ALLOWED_SYMBOLS:
+            df = self.gmo_fetcher.fetch_klines(symbol, interval="15min")
+            if df.empty or len(df) < 20:
+                base_price = self.rates_cache.get(symbol, {}).get("bid", 150.0)
+                df = generate_fallback_candle_data(base_price=base_price, count=50)
+            historical_data[symbol] = df
+
+        if historical_data:
+            current_p = self.strategy.get_parameters()
+            best_p = self.optimizer.optimize_parameters(historical_data, current_p)
+            self.strategy.update_parameters(best_p)
+
+        # 2. 取引集計＆元帳CSV出力
+        daily_summary = self.trader.generate_daily_report(target_date)
+        self.reporter.export_csv_ledger(self.trader.trade_history, f"trade_ledger_{target_date}.csv")
+
+        # DailyBatchProcessor へ返却する辞書データ
+        return {
+            "realized_pnl": daily_summary.get("realized_pnl", 0.0),
+            "trades_count": daily_summary.get("trades_count", 0),
+            "win_rate": daily_summary.get("win_rate", 0.0),
+            "ending_balance": self.trader.portfolio.balance
+        }
 
     def _send_heartbeat(self):
         uptime_seconds = int(time.time() - self.start_time)
@@ -260,7 +290,6 @@ class SystemOrchestrator:
                 order_res = self.trader.place_order(symbol, sig, amount, current_rates)
                 
                 if order_res.get("status") == "ACCEPTED":
-                    # 新規追加されたポジションに SL/TP を付与
                     for pos_id, pos in self._get_position_iterator():
                         if pos.get("symbol") == symbol and pos.get("sl") is None:
                             pos["sl"] = analysis.get("sl_price")
@@ -275,35 +304,3 @@ class SystemOrchestrator:
 
         health = self.trader.process_account_health_and_losscut(current_rates)
         logger.info(f"口座残高: {self.trader.portfolio.balance:,.0f}円 | 維持率: {health.get('margin_ratio', 'N/A')}% | 含み損益: {health.get('unrealized_pnl', 0):,.0f}円")
-
-    def _process_daily_reporting(self, current_rates: dict):
-        logger.info("==========================================")
-        logger.info(" 日次バッチ処理 ＆ 戦略自己成長（パラメータ最適化）開始")
-        logger.info("==========================================")
-
-        historical_data = {}
-        for symbol in ALLOWED_SYMBOLS:
-            df = self.gmo_fetcher.fetch_klines(symbol, interval="15min")
-            if df.empty or len(df) < 20:
-                base_price = (current_rates[symbol]["ask"] + current_rates[symbol]["bid"]) / 2 if symbol in current_rates else 150.0
-                df = generate_fallback_candle_data(base_price=base_price, count=50)
-            historical_data[symbol] = df
-
-        if historical_data:
-            current_p = self.strategy.get_parameters()
-            best_p = self.optimizer.optimize_parameters(historical_data, current_p)
-            self.strategy.update_parameters(best_p)
-
-        daily_summary = self.trader.generate_daily_report(self.last_date)
-        ai_report = self.market_analyzer.generate_daily_ai_report(daily_summary, self.trader.positions, current_rates)
-        
-        risk_metrics = self.risk_analyzer.calculate_metrics(self.trader.trade_history, self.trader.portfolio.balance, INITIAL_CAPITAL)
-        tax_metrics = self.tax_calculator.calculate_annual_tax(self.trader.trade_history)
-
-        full_report_str = self.reporter.generate_full_report(risk_metrics, tax_metrics, self.trader.portfolio.balance, INITIAL_CAPITAL)
-        logger.info(f"日次レポート出力:\n{full_report_str}")
-
-        opt_info = f"\n🤖 【自己成長通知】適用中パラメータ: {self.strategy.get_parameters()}"
-        self.notifier.notify_daily_report(daily_summary, f"{ai_report}\n\n{full_report_str}{opt_info}")
-        
-        self.reporter.export_csv_ledger(self.trader.trade_history, f"trade_ledger_{self.last_date}.csv")
