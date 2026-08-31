@@ -1,34 +1,18 @@
-# trader/strategy.py
-import os
-import json
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone, timedelta
-
-JST = timezone(timedelta(hours=9))
-PARAMS_FILE = "config/active_params.json"
+from typing import Dict, Any, List
 
 class BasicStrategy:
-    """
-    テクニカル指標 (SMA + RSI + ATR) 及び動的リスク管理戦略
-    """
+    """外為どっとコム掲載のローソク足パターン全種を自動検知する拡張戦略クラス"""
+
     def __init__(self, short_window: int = 5, long_window: int = 20, rsi_window: int = 14, atr_window: int = 14):
         self.short_window = short_window
         self.long_window = long_window
         self.rsi_window = rsi_window
         self.atr_window = atr_window
-
-        # 起動時に保存済みパラメータが存在すれば自動ロード
-        self.load_parameters()
-
-        # サーキットブレーカー管理パラメータ
-        self.max_daily_drawdown_ratio = 0.05  # 日次最大許容損失率 5%
-        self.initial_daily_balance = None
         self.circuit_breaker_triggered = False
-        self.last_reset_date = None
 
-    def get_parameters(self) -> dict:
-        """現在の戦略パラメータを取得"""
+    def get_parameters(self) -> Dict[str, Any]:
         return {
             "short_window": self.short_window,
             "long_window": self.long_window,
@@ -36,152 +20,174 @@ class BasicStrategy:
             "atr_window": self.atr_window
         }
 
-    def update_parameters(self, new_params: dict):
-        """自己成長エンジンからのパラメータ動的適用 ＆ 永続化保存"""
-        old_params = self.get_parameters()
-        self.short_window = new_params.get("short_window", self.short_window)
-        self.long_window = new_params.get("long_window", self.long_window)
-        self.rsi_window = new_params.get("rsi_window", self.rsi_window)
-        self.atr_window = new_params.get("atr_window", self.atr_window)
+    def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
         
-        # ディスクへ保存
-        self.save_parameters()
-        print(f"【戦略自己進化】パラメータ更新＆永続化完了:")
-        print(f"  Old: {old_params}")
-        print(f"  New: {self.get_parameters()}")
-
-    def save_parameters(self):
-        """現在のパラメータをJSONファイルへ保存"""
-        try:
-            os.makedirs("config", exist_ok=True)
-            with open(PARAMS_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.get_parameters(), f, indent=4)
-        except Exception as e:
-            print(f"【エラー】パラメータの保存に失敗しました: {e}")
-
-    def load_parameters(self):
-        """JSONファイルから保存済みパラメータをロード"""
-        if os.path.exists(PARAMS_FILE):
-            try:
-                with open(PARAMS_FILE, "r", encoding="utf-8") as f:
-                    p = json.load(f)
-                    self.short_window = p.get("short_window", self.short_window)
-                    self.long_window = p.get("long_window", self.long_window)
-                    self.rsi_window = p.get("rsi_window", self.rsi_window)
-                    self.atr_window = p.get("atr_window", self.atr_window)
-                    print(f"【起動処理】復元された最適化パラメータ: {self.get_parameters()}")
-            except Exception as e:
-                print(f"【警告】パラメータ設定のロード失敗（デフォルト値を使用します）: {e}")
-
-    def calculate_atr(self, df: pd.DataFrame) -> float:
-        """
-        ATR (Average True Range) の計算
-        """
-        if len(df) < self.atr_window + 1:
-            return 0.10  # デフォルト値 (10ピップス相当)
-
-        high = df['high']
-        low = df['low']
-        close_prev = df['close'].shift(1)
-
-        tr1 = high - low
-        tr2 = (high - close_prev).abs()
-        tr3 = (low - close_prev).abs()
-
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(window=self.atr_window).mean().iloc[-1]
-        return float(atr) if not np.isnan(atr) and atr > 0 else 0.10
-
-    def generate_signal(self, df: pd.DataFrame) -> dict:
-        """
-        シグナル生成 + ATR動的SL/TPの算出
-        """
-        if self.circuit_breaker_triggered:
-            return {"signal": "HOLD", "reason": "Circuit Breaker Active (Daily Max Loss Reached)", "sl_price": None, "tp_price": None, "atr": 0.0}
-
-        if len(df) < self.long_window:
-            return {"signal": "HOLD", "reason": "Insufficient Data", "sl_price": None, "tp_price": None, "atr": 0.0}
-
+        # 移動平均線 (SMA)
         df['sma_short'] = df['close'].rolling(window=self.short_window).mean()
         df['sma_long'] = df['close'].rolling(window=self.long_window).mean()
 
-        # RSI計算
+        # RSI
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=self.rsi_window).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=self.rsi_window).mean()
         rs = gain / loss.replace(0, np.nan)
         df['rsi'] = 100 - (100 / (1 + rs))
 
-        curr_close = df['close'].iloc[-1]
-        curr_short = df['sma_short'].iloc[-1]
-        curr_long = df['sma_long'].iloc[-1]
-        prev_short = df['sma_short'].iloc[-2]
-        prev_long = df['sma_long'].iloc[-2]
-        curr_rsi = df['rsi'].iloc[-1] if not np.isnan(df['rsi'].iloc[-1]) else 50.0
+        # ATR
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['atr'] = tr.rolling(window=self.atr_window).mean()
 
-        atr = self.calculate_atr(df)
+        return df
+
+    @staticmethod
+    def detect_candlestick_patterns(df: pd.DataFrame) -> Dict[str, bool]:
+        """
+        1本足・2本足・3本足のローソク足パターンを四本値から包括的に計算
+        """
+        results = {
+            # 1本足
+            "bullish_marubozu": False, "bearish_marubozu": False,  # 大陽線 / 大陰線
+            "doji": False,                                         # 十字線 (転換点)
+            "hammer_pinbar": False,                                # 下ヒゲ / タクリ足 (強気反転)
+            "shooting_star_pinbar": False,                         # 上ヒゲ / 首吊り線 (弱気反転)
+            # 2本足
+            "bullish_engulfing": False, "bearish_engulfing": False, # 包み線
+            "bullish_harami": False, "bearish_harami": False,       # はらみ線
+            "piercing_line": False,                                # 切り込み線 (強気)
+            "dark_cloud_cover": False,                             # かぶせ線 (弱気)
+            # 3本足
+            "three_red_soldiers": False,                           # 赤三兵 (強力な買い)
+            "three_black_crows": False,                            # 黒三兵 (強力な売り)
+            "morning_star": False,                                 # 明けの明星 (底打ち反転)
+            "evening_star": False                                  # 宵の明星 (天井反転)
+        }
+
+        if len(df) < 3:
+            return results
+
+        c0 = df.iloc[-1]  # 最新足
+        c1 = df.iloc[-2]  # 1本前
+        c2 = df.iloc[-3]  # 2本前
+
+        def body(c): return abs(c['close'] - c['open'])
+        def range_total(c): return max(c['high'] - c['low'], 0.0001)
+        def is_bull(c): return c['close'] > c['open']
+        def is_bear(c): return c['close'] < c['open']
+
+        # --- 1本足パターンの判定 ---
+        # 十字線 (実体が全体の値幅の10%以下)
+        results["doji"] = (body(c0) / range_total(c0)) <= 0.10
+
+        # 大陽線 / 大陰線 (実体が全体の75%以上)
+        results["bullish_marubozu"] = is_bull(c0) and (body(c0) / range_total(c0) >= 0.75)
+        results["bearish_marubozu"] = is_bear(c0) and (body(c0) / range_total(c0) >= 0.75)
+
+        # ピンバー（タクリ足・ハンマー / 首吊り線・流れ星）
+        lower_shadow0 = min(c0['open'], c0['close']) - c0['low']
+        upper_shadow0 = c0['high'] - max(c0['open'], c0['close'])
+        results["hammer_pinbar"] = (lower_shadow0 >= 2 * body(c0)) and (upper_shadow0 <= body(c0) * 0.5)
+        results["shooting_star_pinbar"] = (upper_shadow0 >= 2 * body(c0)) and (lower_shadow0 <= body(c0) * 0.5)
+
+        # --- 2本足パターンの判定 ---
+        # 包み線 (エンガルフィング)
+        results["bullish_engulfing"] = is_bear(c1) and is_bull(c0) and (c0['open'] <= c1['close']) and (c0['close'] >= c1['open'])
+        results["bearish_engulfing"] = is_bull(c1) and is_bear(c0) and (c0['open'] >= c1['close']) and (c0['close'] <= c1['open'])
+
+        # はらみ線 (ハラミ)
+        results["bullish_harami"] = is_bear(c1) and is_bull(c0) and (c0['open'] > c1['close']) and (c0['close'] < c1['open'])
+        results["bearish_harami"] = is_bull(c1) and is_bear(c0) and (c0['open'] < c1['close']) and (c0['close'] > c1['open'])
+
+        # 切り込み線 (陰線のあと、前足実体の中値以上まで押し返す陽線)
+        c1_mid = c1['open'] - (body(c1) / 2)
+        results["piercing_line"] = is_bear(c1) and is_bull(c0) and (c0['open'] < c1['low']) and (c0['close'] > c1_mid) and (c0['close'] < c1['open'])
+
+        # かぶせ線 (陽線のあと、前足実体の中値以下まで食い込む陰線)
+        c1_mid_bear = c1['open'] + (body(c1) / 2)
+        results["dark_cloud_cover"] = is_bull(c1) and is_bear(c0) and (c0['open'] > c1['high']) and (c0['close'] < c1_mid_bear) and (c0['close'] > c1['open'])
+
+        # --- 3本足パターンの判定 ---
+        # 赤三兵 (陽線が3本連続して下値を切り上げる)
+        results["three_red_soldiers"] = is_bull(c2) and is_bull(c1) and is_bull(c0) and \
+                                         (c2['close'] < c1['close'] < c0['close']) and \
+                                         (c2['open'] < c1['open'] < c0['open'])
+
+        # 黒三兵 (陰線が3本連続して上値を切り下げる)
+        results["three_black_crows"] = is_bear(c2) and is_bear(c1) and is_bear(c0) and \
+                                        (c2['close'] > c1['close'] > c0['close']) and \
+                                        (c2['open'] > c1['open'] > c0['open'])
+
+        # 明けの明星 (大陰線 → 小足/十字線 → 大陽線)
+        results["morning_star"] = is_bear(c2) and (body(c1) < body(c2) * 0.4) and is_bull(c0) and (c0['close'] > (c2['open'] + c2['close']) / 2)
+
+        # 宵の明星 (大陽線 → 小足/十字線 → 大陰線)
+        results["evening_star"] = is_bull(c2) and (body(c1) < body(c2) * 0.4) and is_bear(c0) and (c0['close'] < (c2['open'] + c2['close']) / 2)
+
+        return results
+
+    def generate_signal(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if len(df) < self.long_window + 1:
+            return {"signal": "HOLD", "reason": "データ不足"}
+
+        df_ind = self._calculate_indicators(df)
+        curr = df_ind.iloc[-1]
+        prev = df_ind.iloc[-2]
+
+        patterns = self.detect_candlestick_patterns(df_ind)
+
+        # テクニカル指標（SMAクロス）
+        gold_cross = (prev['sma_short'] <= prev['sma_long']) and (curr['sma_short'] > curr['sma_long'])
+        dead_cross = (prev['sma_short'] >= prev['sma_long']) and (curr['sma_short'] < curr['sma_long'])
+
+        # 強気 / 弱気パターンの集計
+        bullish_keys = ["bullish_marubozu", "hammer_pinbar", "bullish_engulfing", "bullish_harami", "piercing_line", "three_red_soldiers", "morning_star"]
+        bearish_keys = ["bearish_marubozu", "shooting_star_pinbar", "bearish_engulfing", "bearish_harami", "dark_cloud_cover", "three_black_crows", "evening_star"]
+
+        active_bullish = [k for k in bullish_keys if patterns.get(k)]
+        active_bearish = [k for k in bearish_keys if patterns.get(k)]
 
         signal = "HOLD"
-        reason = f"SMA_S:{curr_short:.2f}, SMA_L:{curr_long:.2f}, RSI:{curr_rsi:.1f}"
+        reason = "NONE"
 
-        # ゴールデンクロス & RSI過熱感チェック
-        if prev_short <= prev_long and curr_short > curr_long and curr_rsi < 70:
+        # 1. ゴールデンクロス / デッドクロス (最優先)
+        if gold_cross and curr['rsi'] < 70:
             signal = "BUY"
-            reason = f"Golden Cross Detected (RSI: {curr_rsi:.1f})"
-        # デッドクロス & RSI売られすぎチェック
-        elif prev_short >= prev_long and curr_short < curr_long and curr_rsi > 30:
+            reason = f"Golden Cross (RSI: {curr['rsi']:.1f})"
+        elif dead_cross and curr['rsi'] > 30:
             signal = "SELL"
-            reason = f"Dead Cross Detected (RSI: {curr_rsi:.1f})"
+            reason = f"Dead Cross (RSI: {curr['rsi']:.1f})"
+        # 2. 複合ローソク足パターンシグナル (RSI過熱感フィルター適用)
+        elif active_bullish and curr['rsi'] < 65:
+            signal = "BUY"
+            reason = f"Bullish Pattern [{', '.join(active_bullish)}] (RSI: {curr['rsi']:.1f})"
+        elif active_bearish and curr['rsi'] > 35:
+            signal = "SELL"
+            reason = f"Bearish Pattern [{', '.join(active_bearish)}] (RSI: {curr['rsi']:.1f})"
 
-        # ATRに基づく可変ストップロス(1.5x ATR) / テイクプロフィット(3.0x ATR)
-        sl_price, tp_price = None, None
-        if signal == "BUY":
-            sl_price = round(curr_close - (atr * 1.5), 3)
-            tp_price = round(curr_close + (atr * 3.0), 3)
-        elif signal == "SELL":
-            sl_price = round(curr_close + (atr * 1.5), 3)
-            tp_price = round(curr_close - (atr * 3.0), 3)
+        atr = curr['atr'] if not np.isnan(curr['atr']) else 0.10
+        close_price = curr['close']
+
+        sl_price = round(close_price - (atr * 2.0), 3) if signal == "BUY" else round(close_price + (atr * 2.0), 3)
+        tp_price = round(close_price + (atr * 3.0), 3) if signal == "BUY" else round(close_price - (atr * 3.0), 3)
 
         return {
             "signal": signal,
             "reason": reason,
             "atr": atr,
-            "sl_price": sl_price,
-            "tp_price": tp_price
+            "sl_price": sl_price if signal != "HOLD" else None,
+            "tp_price": tp_price if signal != "HOLD" else None,
+            "patterns": patterns
         }
 
-    def calculate_position_size(self, balance: float, entry_price: float, risk_ratio: float, atr: float = 0.10) -> int:
-        """
-        定率リスクモデル（Fixed Fractional Risk）に基づく建玉数量計算
-        リスク許容額 = 口座残高 * risk_ratio
-        損切り幅 = ATR * 1.5
-        """
-        if balance <= 0 or entry_price <= 0:
-            return 0
-
+    def calculate_position_size(self, balance: float, current_price: float, risk_ratio: float, atr: float) -> float:
         risk_amount = balance * risk_ratio
-        sl_distance = max(atr * 1.5, 0.05)  # 最小5ピップスは確保
-
-        # 1通貨あたりの損失額(円) = sl_distance
-        raw_units = risk_amount / sl_distance
+        stop_loss_pip_val = max(atr * 2.0, 0.10)
         
-        # GMOコイン FXの最小取引単位: 100通貨単位で丸め
-        units = int(raw_units // 100) * 100
-        return max(units, 100)  # 最低100通貨
+        loss_per_1000_units = stop_loss_pip_val * 1000
+        units = (risk_amount / loss_per_1000_units) * 1000
+        units = max(1000, int(units // 1000) * 1000)
+        return float(units)
 
-    def check_circuit_breaker(self, current_balance: float) -> bool:
-        """
-        日次サーキットブレーカーチェック
-        """
-        today_str = datetime.now(JST).strftime("%Y-%m-%d")
-        if self.last_reset_date != today_str:
-            self.initial_daily_balance = current_balance
-            self.circuit_breaker_triggered = False
-            self.last_reset_date = today_str
-
-        if self.initial_daily_balance and self.initial_daily_balance > 0:
-            drawdown = (self.initial_daily_balance - current_balance) / self.initial_daily_balance
-            if drawdown >= self.max_daily_drawdown_ratio:
-                self.circuit_breaker_triggered = True
-
-        return self.circuit_breaker_triggered
