@@ -2,10 +2,28 @@ import time
 import traceback
 import threading
 from datetime import datetime, timezone, timedelta
+from typing import Dict, Any
 
-from config.settings import GEMINI_API_KEY, DISCORD_WEBHOOK_URL, ALLOWED_SYMBOLS, INITIAL_CAPITAL, RISK_RATIO
-from trader.gmo_fx_engine import GMOFXEngine
-from trader.strategy import BasicStrategy
+from config.settings import (
+    GEMINI_API_KEY, 
+    DISCORD_WEBHOOK_URL, 
+    ALLOWED_SYMBOLS, 
+    INITIAL_CAPITAL, 
+    RISK_RATIO,
+    TRADING_STYLE  # 例: "SCALPING", "DAYTRADE", "SWING", "POSITION" (設定されていなければ "DAYTRADE")
+)
+
+# 1. 修正後のモジュールパスインポート
+from trader.engine.gmo_fx_engine import GMOFXEngine
+from trader.engine.gmo_rules import GMORuleValidator
+from trader.strategies import (
+    BasicStrategy,
+    StandardOpportunityStrategy,
+    DaytradeStrategy,
+    SwingStrategy,
+    PositionStrategy
+)
+
 from analyzer.market_analyzer import MarketAnalyzer
 from analyzer.risk_analyzer import RiskAnalyzer
 from analyzer.notifier import DiscordNotifier
@@ -19,11 +37,23 @@ from utils.logger import logger
 JST = timezone(timedelta(hours=9))
 
 class SystemOrchestrator:
-    """GMOコイン FX 実データ専用 統合管理エンジン"""
+    """GMOコイン FX 実データ専用 統合管理エンジン（マルチスタイル対応版）"""
+
+    # 取引スタイルに応じたKライン取得足（タイムフレーム）マッピング
+    TIMEFRAME_MAP = {
+        "SCALPING": "1min",
+        "DAYTRADE": "15min",
+        "SWING": "4h",
+        "POSITION": "1day"
+    }
 
     def __init__(self):
         self.trader = GMOFXEngine(initial_capital=INITIAL_CAPITAL)
-        self.strategy = BasicStrategy(short_window=5, long_window=20, rsi_window=14, atr_window=14)
+        
+        # 2. 取引スタイルに応じた戦略インスタンスの初期化
+        self.trading_style = getattr(self, "trading_style", getattr(globals().get("settings"), "TRADING_STYLE", "DAYTRADE"))
+        self.strategies: Dict[str, Any] = self._init_strategies(self.trading_style)
+
         self.market_analyzer = MarketAnalyzer(api_key=GEMINI_API_KEY)
         self.risk_analyzer = RiskAnalyzer()
         self.tax_calculator = TaxCalculator()
@@ -39,13 +69,30 @@ class SystemOrchestrator:
         
         self.start_time = time.time()
         self.last_signal_check_time = 0.0
-        self.signal_check_interval = 60.0
+        self.signal_check_interval = 60.0  # 1分周期
         self.last_heartbeat_time = time.time()
         self.heartbeat_interval = 21600.0  # 6時間
+
+    def _init_strategies(self, style: str) -> Dict[str, Any]:
+        """通貨ペアごとに適切な戦略クラスを生成"""
+        strategies = {}
+        for symbol in ALLOWED_SYMBOLS:
+            if style == "SCALPING":
+                strategies[symbol] = StandardOpportunityStrategy(symbol=symbol)
+            elif style == "DAYTRADE":
+                strategies[symbol] = DaytradeStrategy(symbol=symbol)
+            elif style == "SWING":
+                strategies[symbol] = SwingStrategy(symbol=symbol)
+            elif style == "POSITION":
+                strategies[symbol] = PositionStrategy(symbol=symbol)
+            else:
+                strategies[symbol] = BasicStrategy()
+        return strategies
 
     def run_loop(self):
         logger.info("==========================================")
         logger.info(" GMOコイン FX 自動トレードシステム起動")
+        logger.info(f" 適用スタイル: {self.trading_style}")
         logger.info(f" 初期資金: {INITIAL_CAPITAL:,.0f}円 | レバレッジ: 25倍")
         logger.info("==========================================")
 
@@ -54,7 +101,7 @@ class SystemOrchestrator:
                 now_time = time.time()
                 now_jst = datetime.now(JST)
 
-                # 最新のレートをREST APIから取得（またはWebSocketキャッシュ）
+                # 最新のレートをREST APIから取得
                 fetched = self.gmo_fetcher.fetch_ticker()
                 if fetched:
                     with self.cache_lock:
@@ -125,37 +172,47 @@ class SystemOrchestrator:
 
     def _process_signal_evaluation(self, now_jst: datetime, current_rates: dict):
         """シグナル評価および新規注文発行"""
+        interval = self.TIMEFRAME_MAP.get(self.trading_style, "15min")
+
         for symbol in ALLOWED_SYMBOLS:
             if symbol not in current_rates:
                 continue
 
-            # GMOコインAPIから実ローソク足データを取得
-            df_candles = self.gmo_fetcher.fetch_klines(symbol, interval="15min")
+            # スタイルに応じた足種類のローソク足データを取得
+            df_candles = self.gmo_fetcher.fetch_klines(symbol, interval=interval)
             
-            # 休場中やデータ取得失敗時はスキップ（疑似データ生成は行わない）
             if df_candles.empty or len(df_candles) < 20:
                 continue
 
-            analysis = self.strategy.generate_signal(df_candles)
-            sig, atr = analysis["signal"], analysis.get("atr", 0.10)
+            strategy = self.strategies.get(symbol, self.strategies.get(ALLOWED_SYMBOLS[0]))
+            analysis = strategy.generate_signal(df_candles)
+            sig = analysis.get("signal", "HOLD")
+            atr = analysis.get("atr", 0.10)
 
             if sig in ["BUY", "SELL"]:
-                amount = self.strategy.calculate_position_size(
-                    self.trader.balance, 
-                    current_rates[symbol]["ask"] if sig == "BUY" else current_rates[symbol]["bid"], 
-                    RISK_RATIO, atr
-                )
-                
+                # 発注数量の計算（BasicStrategy互換処理またはデフォルト計算）
+                if hasattr(strategy, "calculate_position_size"):
+                    amount = strategy.calculate_position_size(
+                        self.trader.balance, 
+                        current_rates[symbol]["ask"] if sig == "BUY" else current_rates[symbol]["bid"], 
+                        RISK_RATIO, atr
+                    )
+                else:
+                    # デフォルト計算（リスク率と証拠金制限に基づく1,000単位丸め）
+                    risk_amount = self.trader.balance * RISK_RATIO
+                    entry_price = current_rates[symbol]["ask"] if sig == "BUY" else current_rates[symbol]["bid"]
+                    raw_units = risk_amount / (entry_price * 0.01)
+                    amount = max(1000.0, float(int(raw_units // 1000) * 1000))
+
                 order_res = self.trader.place_order(symbol, sig, amount, current_rates)
                 
                 if order_res.get("status") == "ACCEPTED":
                     new_pos_id = order_res["id"]
-                    # SL/TPの設定
                     if new_pos_id in self.trader.positions:
                         self.trader.positions[new_pos_id]["sl"] = analysis.get("sl_price")
                         self.trader.positions[new_pos_id]["tp"] = analysis.get("tp_price")
 
-                    logger.info(f"【約定成功】{symbol} {sig} {amount:,}通貨 (価格: {order_res['price']:.3f})")
+                    logger.info(f"【約定成功】[{self.trading_style}] {symbol} {sig} {amount:,.0f}通貨 (価格: {order_res['price']:.3f})")
                     self.notifier.notify_trade_executed({
                         "symbol": symbol, "side": sig, "amount": amount,
                         "price": order_res["price"], "fee": 0,
@@ -169,11 +226,14 @@ class SystemOrchestrator:
 
     def _send_heartbeat(self):
         uptime_seconds = int(time.time() - self.start_time)
+        first_strat = list(self.strategies.values())[0] if self.strategies else None
+        
         status_info = {
             "uptime": f"{uptime_seconds // 3600}時間{(uptime_seconds % 3600) // 60}分",
             "balance": self.trader.balance,
             "open_positions": len(self.trader.positions),
-            "params": self.strategy.get_parameters(),
-            "cb_triggered": self.strategy.circuit_breaker_triggered
+            "style": self.trading_style,
+            "params": getattr(first_strat, "get_parameters", lambda: {"style": self.trading_style})(),
+            "cb_triggered": getattr(first_strat, "circuit_breaker_triggered", False)
         }
         self.notifier.notify_heartbeat(status_info)
