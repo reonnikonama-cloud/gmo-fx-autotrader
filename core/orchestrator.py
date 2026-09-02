@@ -40,7 +40,7 @@ class SystemOrchestrator:
     STYLE_CONFIG = {
         "SCALPING": {"interval": "1min", "class": StandardOpportunityStrategy},
         "DAYTRADE": {"interval": "15min", "class": DaytradeStrategy},
-        "SWING":    {"interval": "4h",    "class": SwingStrategy},
+        "SWING":    {"interval": "4hour",    "class": SwingStrategy},
         "POSITION": {"interval": "1day",  "class": PositionStrategy}
     }
 
