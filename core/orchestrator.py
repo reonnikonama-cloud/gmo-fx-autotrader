@@ -2,22 +2,19 @@ import time
 import traceback
 import threading
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from config.settings import (
     GEMINI_API_KEY, 
     DISCORD_WEBHOOK_URL, 
     ALLOWED_SYMBOLS, 
     INITIAL_CAPITAL, 
-    RISK_RATIO,
-    TRADING_STYLE  # 例: "SCALPING", "DAYTRADE", "SWING", "POSITION" (設定されていなければ "DAYTRADE")
+    RISK_RATIO
 )
 
-# 1. 修正後のモジュールパスインポート
 from trader.engine.gmo_fx_engine import GMOFXEngine
 from trader.engine.gmo_rules import GMORuleValidator
 from trader.strategies import (
-    BasicStrategy,
     StandardOpportunityStrategy,
     DaytradeStrategy,
     SwingStrategy,
@@ -37,22 +34,22 @@ from utils.logger import logger
 JST = timezone(timedelta(hours=9))
 
 class SystemOrchestrator:
-    """GMOコイン FX 実データ専用 統合管理エンジン（マルチスタイル対応版）"""
+    """全トレードスタイル（マルチタイムフレーム）同時並列実行エンジン"""
 
-    # 取引スタイルに応じたKライン取得足（タイムフレーム）マッピング
-    TIMEFRAME_MAP = {
-        "SCALPING": "1min",
-        "DAYTRADE": "15min",
-        "SWING": "4h",
-        "POSITION": "1day"
+    # 各スタイルごとの監視足設定
+    STYLE_CONFIG = {
+        "SCALPING": {"interval": "1min", "class": StandardOpportunityStrategy},
+        "DAYTRADE": {"interval": "15min", "class": DaytradeStrategy},
+        "SWING":    {"interval": "4h",    "class": SwingStrategy},
+        "POSITION": {"interval": "1day",  "class": PositionStrategy}
     }
 
     def __init__(self):
         self.trader = GMOFXEngine(initial_capital=INITIAL_CAPITAL)
         
-        # 2. 取引スタイルに応じた戦略インスタンスの初期化
-        self.trading_style = getattr(self, "trading_style", getattr(globals().get("settings"), "TRADING_STYLE", "DAYTRADE"))
-        self.strategies: Dict[str, Any] = self._init_strategies(self.trading_style)
+        # スタイル x 通貨ペア の戦略マトリックス初期化
+        # 例: self.strategies["DAYTRADE"]["USD_JPY"]
+        self.strategies: Dict[str, Dict[str, Any]] = self._init_all_strategies()
 
         self.market_analyzer = MarketAnalyzer(api_key=GEMINI_API_KEY)
         self.risk_analyzer = RiskAnalyzer()
@@ -69,30 +66,24 @@ class SystemOrchestrator:
         
         self.start_time = time.time()
         self.last_signal_check_time = 0.0
-        self.signal_check_interval = 60.0  # 1分周期
+        self.signal_check_interval = 60.0  # 1分周期で全スタイルを一括スキャン
         self.last_heartbeat_time = time.time()
         self.heartbeat_interval = 21600.0  # 6時間
 
-    def _init_strategies(self, style: str) -> Dict[str, Any]:
-        """通貨ペアごとに適切な戦略クラスを生成"""
-        strategies = {}
-        for symbol in ALLOWED_SYMBOLS:
-            if style == "SCALPING":
-                strategies[symbol] = StandardOpportunityStrategy(symbol=symbol)
-            elif style == "DAYTRADE":
-                strategies[symbol] = DaytradeStrategy(symbol=symbol)
-            elif style == "SWING":
-                strategies[symbol] = SwingStrategy(symbol=symbol)
-            elif style == "POSITION":
-                strategies[symbol] = PositionStrategy(symbol=symbol)
-            else:
-                strategies[symbol] = BasicStrategy()
-        return strategies
+    def _init_all_strategies(self) -> Dict[str, Dict[str, Any]]:
+        """全スタイル・全通貨ペアの戦略インスタンスを一括生成"""
+        matrix = {}
+        for style, config in self.STYLE_CONFIG.items():
+            strategy_cls = config["class"]
+            matrix[style] = {
+                symbol: strategy_cls(symbol=symbol) for symbol in ALLOWED_SYMBOLS
+            }
+        return matrix
 
     def run_loop(self):
         logger.info("==========================================")
-        logger.info(" GMOコイン FX 自動トレードシステム起動")
-        logger.info(f" 適用スタイル: {self.trading_style}")
+        logger.info(" GMOコイン FX マルチスタイル並列自動トレードシステム起動")
+        logger.info(f" 稼働スタイル: {list(self.STYLE_CONFIG.keys())}")
         logger.info(f" 初期資金: {INITIAL_CAPITAL:,.0f}円 | レバレッジ: 25倍")
         logger.info("==========================================")
 
@@ -101,7 +92,6 @@ class SystemOrchestrator:
                 now_time = time.time()
                 now_jst = datetime.now(JST)
 
-                # 最新のレートをREST APIから取得
                 fetched = self.gmo_fetcher.fetch_ticker()
                 if fetched:
                     with self.cache_lock:
@@ -117,10 +107,10 @@ class SystemOrchestrator:
                     if health.get("losscut_executed"):
                         self.notifier.notify_system_error("【警告】証拠金維持率低下によりロスカットが実行されました。")
 
-                # ② テクニカル分析 ＆ シグナル評価 (1分周期)
+                # ② 全スタイル x 全通貨ペアの並列シグナル評価 (1分周期)
                 if now_time - self.last_signal_check_time >= self.signal_check_interval:
                     self.last_signal_check_time = now_time
-                    self._process_signal_evaluation(now_jst, current_rates)
+                    self._process_all_style_evaluations(now_jst, current_rates)
 
                 # ③ 定期的ハートビート通知
                 if now_time - self.last_heartbeat_time >= self.heartbeat_interval:
@@ -139,7 +129,7 @@ class SystemOrchestrator:
                 time.sleep(10)
 
     def _process_realtime_sl_tp(self, current_rates: dict):
-        """ポジションごとのSL/TP判定"""
+        """全ポジションのSL/TP決済判定"""
         for pos_id, pos in list(self.trader.positions.items()):
             sym = pos.get("symbol")
             if not sym or sym not in current_rates:
@@ -163,61 +153,55 @@ class SystemOrchestrator:
                     close_reason = f"TP到達 ({curr_price:.3f} <= {tp:.3f})"
 
             if close_reason:
+                style_tag = pos.get("style", "UNKNOWN")
                 res = self.trader.close_position(pos_id, curr_price, reason=close_reason)
-                logger.info(f"【自動決済】[{sym}] {pos['side']} | 理由: {close_reason} | 損益: {res['pnl']:,.0f}円")
+                logger.info(f"【自動決済】[{style_tag}][{sym}] {pos['side']} | 理由: {close_reason} | 損益: {res['pnl']:,.0f}円")
                 self.notifier.notify_trade_executed({
                     "symbol": sym, "side": f"CLOSE_{pos['side']}", "amount": pos["amount"],
-                    "price": curr_price, "fee": 0, "pnl": res["pnl"]
+                    "price": curr_price, "fee": 0, "pnl": res["pnl"], "style": style_tag
                 })
 
-    def _process_signal_evaluation(self, now_jst: datetime, current_rates: dict):
-        """シグナル評価および新規注文発行"""
-        interval = self.TIMEFRAME_MAP.get(self.trading_style, "15min")
+    def _process_all_style_evaluations(self, now_jst: datetime, current_rates: dict):
+        """全スタイル（1分・15分・4時間・日足）のローソク足を取得し一括でシグナル評価"""
+        for style, config in self.STYLE_CONFIG.items():
+            interval = config["interval"]
 
-        for symbol in ALLOWED_SYMBOLS:
-            if symbol not in current_rates:
-                continue
+            for symbol in ALLOWED_SYMBOLS:
+                if symbol not in current_rates:
+                    continue
 
-            # スタイルに応じた足種類のローソク足データを取得
-            df_candles = self.gmo_fetcher.fetch_klines(symbol, interval=interval)
-            
-            if df_candles.empty or len(df_candles) < 20:
-                continue
+                df_candles = self.gmo_fetcher.fetch_klines(symbol, interval=interval)
+                if df_candles.empty or len(df_candles) < 20:
+                    continue
 
-            strategy = self.strategies.get(symbol, self.strategies.get(ALLOWED_SYMBOLS[0]))
-            analysis = strategy.generate_signal(df_candles)
-            sig = analysis.get("signal", "HOLD")
-            atr = analysis.get("atr", 0.10)
+                strategy = self.strategies[style][symbol]
+                analysis = strategy.generate_signal(df_candles)
+                sig = analysis.get("signal", "HOLD")
+                atr = analysis.get("atr", 0.10)
 
-            if sig in ["BUY", "SELL"]:
-                # 発注数量の計算（BasicStrategy互換処理またはデフォルト計算）
-                if hasattr(strategy, "calculate_position_size"):
-                    amount = strategy.calculate_position_size(
-                        self.trader.balance, 
-                        current_rates[symbol]["ask"] if sig == "BUY" else current_rates[symbol]["bid"], 
-                        RISK_RATIO, atr
-                    )
-                else:
-                    # デフォルト計算（リスク率と証拠金制限に基づく1,000単位丸め）
+                if sig in ["BUY", "SELL"]:
+                    # 発注数量計算（リスク率と各戦略のリスク許容度に基づく）
                     risk_amount = self.trader.balance * RISK_RATIO
                     entry_price = current_rates[symbol]["ask"] if sig == "BUY" else current_rates[symbol]["bid"]
                     raw_units = risk_amount / (entry_price * 0.01)
                     amount = max(1000.0, float(int(raw_units // 1000) * 1000))
 
-                order_res = self.trader.place_order(symbol, sig, amount, current_rates)
-                
-                if order_res.get("status") == "ACCEPTED":
-                    new_pos_id = order_res["id"]
-                    if new_pos_id in self.trader.positions:
-                        self.trader.positions[new_pos_id]["sl"] = analysis.get("sl_price")
-                        self.trader.positions[new_pos_id]["tp"] = analysis.get("tp_price")
+                    order_res = self.trader.place_order(symbol, sig, amount, current_rates)
+                    
+                    if order_res.get("status") == "ACCEPTED":
+                        new_pos_id = order_res["id"]
+                        if new_pos_id in self.trader.positions:
+                            self.trader.positions[new_pos_id]["sl"] = analysis.get("sl_price")
+                            self.trader.positions[new_pos_id]["tp"] = analysis.get("tp_price")
+                            self.trader.positions[new_pos_id]["style"] = style  # スタイル属性を保持
 
-                    logger.info(f"【約定成功】[{self.trading_style}] {symbol} {sig} {amount:,.0f}通貨 (価格: {order_res['price']:.3f})")
-                    self.notifier.notify_trade_executed({
-                        "symbol": symbol, "side": sig, "amount": amount,
-                        "price": order_res["price"], "fee": 0,
-                        "sl": analysis.get('sl_price'), "tp": analysis.get('tp_price')
-                    })
+                        logger.info(f"【約定成功】[{style}][{symbol}] {sig} {amount:,.0f}通貨 (価格: {order_res['price']:.3f})")
+                        self.notifier.notify_trade_executed({
+                            "symbol": symbol, "side": sig, "amount": amount,
+                            "price": order_res["price"], "fee": 0,
+                            "sl": analysis.get('sl_price'), "tp": analysis.get('tp_price'),
+                            "style": style
+                        })
 
     def _fetch_daily_stats_and_optimize(self, target_date: str) -> dict:
         daily_summary = self.trader.generate_daily_report(target_date)
@@ -226,14 +210,10 @@ class SystemOrchestrator:
 
     def _send_heartbeat(self):
         uptime_seconds = int(time.time() - self.start_time)
-        first_strat = list(self.strategies.values())[0] if self.strategies else None
-        
         status_info = {
             "uptime": f"{uptime_seconds // 3600}時間{(uptime_seconds % 3600) // 60}分",
             "balance": self.trader.balance,
             "open_positions": len(self.trader.positions),
-            "style": self.trading_style,
-            "params": getattr(first_strat, "get_parameters", lambda: {"style": self.trading_style})(),
-            "cb_triggered": getattr(first_strat, "circuit_breaker_triggered", False)
+            "active_styles": list(self.STYLE_CONFIG.keys()),
         }
         self.notifier.notify_heartbeat(status_info)
